@@ -11,6 +11,8 @@ pub struct SLACalculatorContract;
 #[cfg(test)]
 mod tests;
 
+mod event_schema;
+
 // -----------------------------------------------------------------------
 // Storage keys
 // -----------------------------------------------------------------------
@@ -96,6 +98,9 @@ pub enum SLAError {
     InvalidReward = 10,            // #70
     InvalidSeverity = 11,          // #70
     RetentionLimitOutOfRange = 12, // SC-013
+    DuplicateOutageInput = 13,       // SC-W5-046
+    InvalidPenaltyAmount = 14,       // SC-W5-046
+    InvalidRewardAmount = 15,         // SC-W5-046
 }
 
 // -----------------------------------------------------------------------
@@ -197,6 +202,36 @@ pub struct StorageVersionInfo {
     pub expected_version: u32,
     /// True when stored_version != expected_version (migration required).
     pub needs_migration: bool,
+}
+
+/// SC-W5-046 – Typed failure code mapping entry for backend bridge consumption.
+///
+/// Each `FailureCode` maps a numeric error code to a machine-readable Symbol
+/// label and a short human-readable description. Backends call
+/// `get_failure_schema` to obtain the full catalogue at startup.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureCode {
+    /// The numeric error code matching the SLAError discriminant.
+    pub code: u32,
+    /// A machine-readable Symbol label (e.g. "AlreadyInitialized").
+    pub label: Symbol,
+    /// A short description of the failure condition.
+    pub description: Symbol,
+}
+
+/// SC-W5-046 – Full catalogue of typed failure codes for backend bridge.
+///
+/// Backend consumers can call `get_failure_schema` once at startup to
+/// pre-load all possible failure codes the contract may return. The schema
+/// is versioned to allow backwards-compatible additions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailureSchema {
+    /// Schema version for the failure code catalogue.
+    pub version: Symbol,
+    /// All known failure codes in ascending order.
+    pub codes: Vec<FailureCode>,
 }
 
 /// SC-W5-029 – Combined version negotiation response for backend startup handshake.
@@ -665,6 +700,55 @@ impl SLACalculatorContract {
         Self::compute_config_version_hash(&env)
     }
 
+    /// SC-W5-046 – Returns the full catalogue of typed failure codes.
+    ///
+    /// Backend bridge consumers call this once at startup to pre-load all
+    /// contract error codes and their human-readable labels. The schema is
+    /// versioned ("v1") so backends can detect additions across upgrades.
+    /// SC-W5-046 – Returns the full catalogue of typed failure codes.
+    ///
+    /// Backend bridge consumers call this once at startup to pre-load all
+    /// contract error codes and their human-readable labels. The schema is
+    /// versioned ("v1") so backends can detect additions across upgrades.
+    pub fn get_failure_schema(env: Env) -> Result<FailureSchema, SLAError> {
+        Self::check_version(&env)?;
+        let mut codes = Vec::new(&env);
+
+        // Emit in numeric order for deterministic consumption
+        // All descriptions must be <= 32 bytes (Soroban Symbol constraint)
+        let entries: [(u32, &str, &str); 15] = [
+            (1, "AlreadyInitialized", "Contract already initialized"),
+            (2, "NotInitialized", "Contract not yet initialized"),
+            (3, "Unauthorized", "Caller lacks required role"),
+            (4, "ConfigNotFound", "No config for severity"),
+            (5, "VersionMismatch", "Storage version mismatch"),
+            (6, "ContractPaused", "Contract is paused"),
+            (7, "NoPendingTransfer", "No pending transfer"),
+            (8, "InvalidThreshold", "Threshold out of range"),
+            (9, "InvalidPenalty", "Penalty out of range"),
+            (10, "InvalidReward", "Reward out of range"),
+            (11, "InvalidSeverity", "Severity not supported"),
+            (12, "RetentionLimitOutOfRange", "Retention limit out of range"),
+            (13, "DuplicateOutageInput", "Duplicate outage input"),
+            (14, "InvalidPenaltyAmount", "Invalid penalty amount"),
+            (15, "InvalidRewardAmount", "Invalid reward amount"),
+        ];
+
+        for (code, label, description) in entries {
+            codes.push_back(FailureCode {
+                code,
+                label: Symbol::new(&env, label),
+                description: Symbol::new(&env, description),
+            });
+        }
+
+        Ok(FailureSchema {
+            version: symbol_short!("v1"),
+            codes,
+        })
+    }
+
+
     pub fn get_result_schema(env: Env) -> Result<SLAResultSchema, SLAError> {
         Self::check_version(&env)?;
         Ok(SLAResultSchema {
@@ -693,6 +777,7 @@ impl SLACalculatorContract {
         features.push_back(symbol_short!("pause"));
         features.push_back(symbol_short!("stats"));
         features.push_back(symbol_short!("history"));
+        features.push_back(symbol_short!("failcode"));
 
         Ok(ContractMetadata {
             contract_name: symbol_short!("sla_calc"),
@@ -729,6 +814,9 @@ impl SLACalculatorContract {
         mttr_minutes: u32,
     ) -> Result<SLAResult, SLAError> {
         Self::check_version(&env)?;
+        // Graceful degradation: validate inputs before processing
+        Self::validate_symbol_input(&outage_id, true)?;
+        Self::validate_symbol_input(&severity, false)?;
         // We bypass pause and operator checks to allow continuous, public verification
         let cfg = Self::load_config(&env, &severity)?;
         let config_version_hash = Self::compute_config_version_hash(&env)?;
@@ -738,13 +826,13 @@ impl SLACalculatorContract {
         // Use the current ledger timestamp so the view result matches the mutating
         // path for the same inputs executed in the same ledger, while still avoiding
         // any state writes or event emission.
-        Ok(Self::compute_result(
+        Self::compute_result(
             outage_id,
             mttr_minutes,
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        ))
+        )
     }
 
     // -------------------------------------------------------------------
@@ -759,6 +847,9 @@ impl SLACalculatorContract {
         mttr_minutes: u32,
     ) -> Result<SLAResult, SLAError> {
         Self::check_version(&env)?;
+        // Graceful degradation: validate inputs before processing
+        Self::validate_symbol_input(&outage_id, true)?;
+        Self::validate_symbol_input(&severity, false)?;
         Self::require_not_paused(&env)?; // #27
         Self::require_operator(&env, &caller)?; // #28
 
@@ -770,7 +861,7 @@ impl SLACalculatorContract {
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        );
+        )?;
         let mut history: Vec<SLAResult> = env
             .storage()
             .instance()
@@ -788,7 +879,7 @@ impl SLACalculatorContract {
             // Explicit duplicate policy: same outage_id is idempotent only when
             // execution inputs resolve to the same deterministic result.
             if prev.mttr_minutes != mttr_minutes || prev.threshold_minutes != cfg.threshold_minutes {
-                panic!("duplicate outage_id with mismatched execution inputs");
+                return Err(SLAError::DuplicateOutageInput);
             }
             return Ok(prev);
         }
@@ -836,14 +927,13 @@ impl SLACalculatorContract {
     /// `config_version_hash` binds the result to the exact config snapshot used
     /// during evaluation. `recorded_at` is the ledger timestamp at call time
     /// (0 in view/audit mode).
-    /// `recorded_at` is the ledger timestamp at call time (0 in view/audit mode).
     fn compute_result(
         outage_id: Symbol,
         mttr_minutes: u32,
         cfg: &SLAConfig,
         config_version_hash: u64,
         recorded_at: u64,
-    ) -> SLAResult {
+    ) -> Result<SLAResult, SLAError> {
         let threshold = cfg.threshold_minutes;
 
         // Case 1: SLA violated → penalty
@@ -852,10 +942,10 @@ impl SLACalculatorContract {
             let penalty = overtime.saturating_mul(cfg.penalty_per_minute);
             let amount = -penalty;
             if amount >= 0 {
-                panic!("invalid penalty amount");
+                return Err(SLAError::InvalidPenaltyAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("viol"),
                 mttr_minutes,
@@ -865,7 +955,7 @@ impl SLACalculatorContract {
                 rating: symbol_short!("poor"),
                 config_version_hash,
                 recorded_at,
-            }
+            })
         } else {
             // Case 2: SLA met → reward
             let performance_ratio = if threshold == 0 {
@@ -887,10 +977,10 @@ impl SLACalculatorContract {
                 .saturating_mul(multiplier as i128)
                 .div_euclid(100);
             if reward <= 0 {
-                panic!("invalid reward amount");
+                return Err(SLAError::InvalidRewardAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("met"),
                 mttr_minutes,
@@ -900,7 +990,7 @@ impl SLACalculatorContract {
                 rating,
                 config_version_hash,
                 recorded_at,
-            }
+            })
         }
     }
 
@@ -948,6 +1038,21 @@ impl SLACalculatorContract {
     }
 
     /// #27 – Blocks execution when the contract is paused.
+    /// Validates that a Symbol is not empty and is within reasonable length limits.
+    /// Returns `InvalidSeverity` for config keys or `InvalidOutageId` for outage IDs
+    /// when validation fails, allowing graceful degradation instead of panicking.
+    fn validate_symbol_input(symbol: &Symbol, is_outage_id: bool) -> Result<(), SLAError> {
+        let s = symbol.to_string();
+        if s.len() == 0 || s.len() > 32 {
+            return Err(if is_outage_id {
+                SLAError::InvalidOutageId
+            } else {
+                SLAError::MalformedSymbolInput
+            });
+        }
+        Ok(())
+    }
+
     fn require_not_paused(env: &Env) -> Result<(), SLAError> {
         let paused: bool = env.storage().instance().get(&PAUSED_KEY).unwrap_or(false);
         if paused {
@@ -1090,7 +1195,14 @@ impl SLACalculatorContract {
         Ok(hash.wrapping_mul(BASE).wrapping_add(0x9e3779b97f4a7c15u64) % MODULUS)
     }
 
+    /// Optimised config lookup with severity index pre-check for early rejection.
+    /// Skips the storage read when the severity is not one of the four canonical
+    /// values, avoiding an unnecessary Map deserialisation for invalid inputs.
     fn load_config(env: &Env, severity: &Symbol) -> Result<SLAConfig, SLAError> {
+        // Early rejection for non-canonical severities — avoids storage read.
+        if !Self::is_canonical_severity(severity) {
+            return Err(SLAError::ConfigNotFound);
+        }
         let configs: Map<Symbol, SLAConfig> = env
             .storage()
             .instance()
